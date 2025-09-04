@@ -1,536 +1,517 @@
 // ==UserScript==
-// @name         Neon Panel Ultra — Conflict-Safe, Persistent, Start-Minimized
-// @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  Ultra neon auto-refresh panel: starts minimized, saves position/shape per-domain, detects other refresh/forward scripts (meta/inline/nav) and prevents auto-start. Force-start override included. All settings persist per-domain.
+// @name         Neon Panel Ultra v5.3 — Debugged & Stable
+// @namespace    https://github.com/yourname/neon-panel-ultra
+// @version      5.3
+// @description  Conflict-safe, persistent, draggable Tampermonkey control: auto-refresh, random-refresh, keyword-stop, compact minimized button, themes, and hotkeys. Debugged drag/mini behavior and live theme updates.
 // @match        *://*/*
 // @grant        none
+// @run-at       document-idle
+// @license      MIT
 // ==/UserScript==
 
 (function () {
-  'use strict';
+  "use strict";
 
-  // Safety: don't run in cross-origin iframes
-  try { if (window.top !== window.self) return; } catch (e) { return; }
+  // ---------- STORAGE ----------
+  const STORAGE_KEY = "ultraNeonPanel_v5_" + window.location.hostname;
+  const saved = (() => {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch { return {}; }
+  })();
 
-  // ----- helpers for per-domain storage -----
-  const DOMAIN = location.hostname;
-  const SKEY = (k) => `neonUltra_v1_${k}_${DOMAIN}`;
-  const get = (k, d = null) => {
-    const v = localStorage.getItem(SKEY(k));
-    if (v === null) return d;
-    try { return JSON.parse(v); } catch { return v; }
-  };
-  const set = (k, v) => localStorage.setItem(SKEY(k), JSON.stringify(v));
-
-  // ----- defaults -----
-  const defaults = {
-    minimized: true,           // start minimized
-    left: null, top: null,     // position
-    width: null, height: null, // size shape (optional)
-    enabled: false,
-    intervalMs: 1000,
-    randomMode: false,
-    maxCount: 0,
-    maxMinutes: 0,
-    untilKeyword: "",
-    cacheBust: true,
-    theme: "Neon Green",
-    sound: true
-  };
-
-  // load settings (per domain)
+  // defaults
   let state = {
-    minimized: get('minimized', defaults.minimized),
-    left: get('left', defaults.left),
-    top: get('top', defaults.top),
-    width: get('width', defaults.width),
-    height: get('height', defaults.height),
-    enabled: get('enabled', defaults.enabled),
-    intervalMs: get('intervalMs', defaults.intervalMs),
-    randomMode: get('randomMode', defaults.randomMode),
-    maxCount: get('maxCount', defaults.maxCount),
-    maxMinutes: get('maxMinutes', defaults.maxMinutes),
-    untilKeyword: get('untilKeyword', defaults.untilKeyword),
-    cacheBust: get('cacheBust', defaults.cacheBust),
-    theme: get('theme', defaults.theme),
-    sound: get('sound', defaults.sound)
+    minimized: saved.minimized !== undefined ? saved.minimized : true,
+    x: saved.x ?? null,
+    y: saved.y ?? null,
+    intervalMs: saved.intervalMs ?? 2000,
+    randomMin: saved.randomMin ?? 1000,
+    randomMax: saved.randomMax ?? 5000,
+    useRandom: saved.useRandom ?? false,
+    autoRefresh: saved.autoRefresh ?? false,
+    theme: saved.theme ?? "#39ff14",
+    keyword: saved.keyword ?? "",
+    cacheBust: saved.cacheBust ?? true,
+    sound: saved.sound ?? true,
   };
 
-  // ----- theme palette -----
-  const THEMES = {
-    "Neon Green": "#39ff14",
-    "Neon Blue": "#3bf5ff",
-    "Neon Pink": "#ff3bf8",
-    "Neon Purple": "#a93bff",
-    "Neon Amber": "#ffc247"
-  };
-
-  // ----- Create panel (minimizable) -----
-  const panel = document.createElement('div');
-  panel.id = 'neonUltraPanel';
-  panel.innerHTML = `
-    <div class="mini-dot" title="Click to expand panel"></div>
-    <div class="full" role="dialog" aria-label="Neon control panel" hidden>
-      <div class="top">
-        <div class="title">Neon Panel Ultra</div>
-        <div class="led" title="Conflict indicator"></div>
-        <button id="forceBtn" title="Force start/override detection">Force Start</button>
-        <button id="closeBtn" title="Minimize panel">_</button>
-      </div>
-      <div class="controls">
-        <button id="toggleBtn">Start</button>
-        <button id="nowBtn" title="Refresh now">⟳ Now</button>
-        <button id="backBtn" title="Back">⬅</button>
-        <button id="fwdBtn" title="Forward">➡</button>
-
-        <label class="field"><span>Interval</span><input id="interval" type="number" min="200" step="100"/></label>
-        <label class="field chk"><input id="random" type="checkbox"/><span>Random ×2</span></label>
-        <label class="field"><span>Until keyword</span><input id="keyword" type="text" placeholder="keyword (optional)"/></label>
-
-        <label class="field"><span>Max #</span><input id="maxCount" type="number" min="0" step="1"/></label>
-        <label class="field"><span>Max min</span><input id="maxMin" type="number" min="0" step="1"/></label>
-
-        <label class="field chk"><input id="cache" type="checkbox"/><span>Cache-bust</span></label>
-        <label class="field"><span>Theme</span><select id="theme"></select></label>
-        <label class="field chk"><input id="sound" type="checkbox"/><span>Sound</span></label>
-      </div>
-
-      <div class="progress-row">
-        <div id="progressWrap"><div id="progressBar"></div></div>
-        <div class="status"><span id="statusText">idle</span> • <span id="countText">0</span></div>
-      </div>
-      <div class="hint">Hotkeys: Ctrl+Alt+R toggle • Ctrl+Alt+N refresh now • Ctrl+Alt+M minimize</div>
-    </div>
-  `;
-  document.body.appendChild(panel);
-
-  // ----- styles -----
-  const style = document.createElement('style');
-  style.textContent = `
-    #neonUltraPanel { position: fixed; z-index: 2147483647; right: 20px; bottom: 20px; font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; }
-    #neonUltraPanel .mini-dot { width: 18px; height: 18px; border-radius: 50%; background: var(--nu, #39ff14); box-shadow: 0 0 12px var(--nu), 0 0 24px var(--nu); cursor: pointer; }
-    #neonUltraPanel .full { width: 760px; max-width: 94vw; background: rgba(0,0,0,0.6); border-radius: 12px; padding: 10px; border: 2px solid var(--nu, #39ff14); box-shadow: 0 0 18px var(--nu), 0 0 36px var(--nu); color: var(--nu, #39ff14); margin-top: 8px; }
-    #neonUltraPanel .top { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
-    #neonUltraPanel .title { font-weight:800; font-size:13px; color:var(--nu); flex:1; }
-    #neonUltraPanel .led { width:12px; height:12px; border-radius:50%; background:#444; box-shadow:0 0 8px rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.06); margin-right:6px; }
-    #neonUltraPanel button { padding:6px 10px; border-radius:8px; border:none; background:var(--nu); color:#000; font-weight:700; cursor:pointer; box-shadow:0 0 10px var(--nu); }
-    #neonUltraPanel .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:8px; }
-    #neonUltraPanel .field { display:flex; align-items:center; gap:6px; color:var(--nu); font-weight:700; font-size:12px; }
-    #neonUltraPanel .field input[type="number"], #neonUltraPanel .field input[type="text"], #neonUltraPanel .field select { background:#000; color:var(--nu); border:2px solid var(--nu); padding:4px 6px; border-radius:6px; font-weight:800; box-shadow: inset 0 0 10px rgba(0,0,0,0.6); min-width:80px; }
-    #neonUltraPanel .field.chk input { width:14px; height:14px; }
-    #progressWrap { height:10px; background:rgba(255,255,255,0.08); border-radius:999px; overflow:hidden; border:1px solid var(--nu); flex:1 1 200px; min-width:120px; }
-    #progressBar { width:0%; height:100%; background:var(--nu); transition:width .1s linear; box-shadow:0 0 12px var(--nu); }
-    .progress-row { display:flex; gap:8px; align-items:center; }
-    .status { color:var(--nu); font-weight:800; font-size:12px; min-width:120px; text-align:right; }
-    .hint { opacity:0.6; font-size:11px; margin-top:6px; color:var(--nu); }
-    #neonUltraPanel.moving { transition:none !important; }
-    #neonUltraPanel .full[hidden] { display:none; }
-    /* compact small screens */
-    @media (max-width:560px){ #neonUltraPanel .full { width:95vw; } }
-  `;
-  document.head.appendChild(style);
-
-  // ----- element refs -----
-  const dot = panel.querySelector('.mini-dot');
-  const full = panel.querySelector('.full');
-  const led = panel.querySelector('.led');
-  const forceBtn = panel.querySelector('#forceBtn');
-  const closeBtn = panel.querySelector('#closeBtn');
-  const toggleBtn = panel.querySelector('#toggleBtn');
-  const nowBtn = panel.querySelector('#nowBtn');
-  const backBtn = panel.querySelector('#backBtn');
-  const fwdBtn = panel.querySelector('#fwdBtn');
-  const intervalInput = panel.querySelector('#interval');
-  const randomInput = panel.querySelector('#random');
-  const keywordInput = panel.querySelector('#keyword');
-  const maxCountInput = panel.querySelector('#maxCount');
-  const maxMinInput = panel.querySelector('#maxMin');
-  const cacheInput = panel.querySelector('#cache');
-  const themeSelect = panel.querySelector('#theme');
-  const soundInput = panel.querySelector('#sound');
-  const progressBar = panel.querySelector('#progressBar');
-  const statusText = panel.querySelector('#statusText');
-  const countText = panel.querySelector('#countText');
-
-  // ----- fill theme select -----
-  Object.keys(THEMES).forEach(name => {
-    const o = document.createElement('option'); o.value = name; o.textContent = name;
-    if (name === state.theme) o.selected = true;
-    themeSelect.appendChild(o);
-  });
-
-  // ----- apply theme color -----
-  function applyTheme(name) {
-    const color = THEMES[name] || THEMES["Neon Green"];
-    panel.style.setProperty('--nu', color);
-  }
-  applyTheme(state.theme);
-
-  // ----- restore position and shape -----
-  function restorePlacement() {
-    if (state.left !== null && state.top !== null) {
-      panel.style.left = state.left + 'px';
-      panel.style.top = state.top + 'px';
-      panel.style.right = 'auto';
-      panel.style.bottom = 'auto';
-      panel.style.position = 'fixed';
-    } else {
-      // keep default bottom/right
-      panel.style.right = '20px';
-      panel.style.bottom = '20px';
-    }
-    if (state.width) full.style.width = state.width + 'px';
-    if (state.height) full.style.height = state.height + 'px';
-    if (state.minimized) {
-      full.hidden = true;
-      panel.classList.remove('open');
-      dot.style.display = ''; // show dot
-    } else {
-      full.hidden = false;
-      panel.classList.add('open');
-      dot.style.display = 'none';
-    }
-  }
-  restorePlacement();
-
-  // ----- save placement -----
-  function savePlacement() {
-    const rect = panel.getBoundingClientRect();
-    // Only save if panel is positioned fixed
-    if (panel.style.position === 'fixed') {
-      set('left', rect.left);
-      set('top', rect.top);
-      state.left = rect.left; state.top = rect.top;
-    }
-    // save width/height of full panel
-    set('width', full.offsetWidth);
-    set('height', full.offsetHeight);
-    state.width = full.offsetWidth; state.height = full.offsetHeight;
+  function persist() {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) {}
   }
 
-  // ----- populate inputs with saved state -----
-  intervalInput.value = state.intervalMs;
-  randomInput.checked = !!state.randomMode;
-  keywordInput.value = state.untilKeyword || '';
-  maxCountInput.value = state.maxCount || 0;
-  maxMinInput.value = state.maxMinutes || 0;
-  cacheInput.checked = !!state.cacheBust;
-  soundInput.checked = !!state.sound;
-
-  // ----- conflict detection heuristics -----
-  function detectMetaRefresh() {
-    return !!document.querySelector('meta[http-equiv="refresh"]');
-  }
-
-  function detectNavTypeReloadOrBackForward() {
+  // ---------- CONFLICT DETECTION ----------
+  function detectConflictOnce() {
     try {
-      const nav = performance.getEntriesByType('navigation')[0];
-      if (!nav) return false;
-      // types: navigate, reload, back_forward
-      return nav.type === 'reload' || nav.type === 'back_forward';
-    } catch (e) { return false; }
-  }
-
-  function detectInlineScriptsCallingLocation() {
-    // look for inline script tags containing keywords that suggest other scripts will reload/replace/forward
-    try {
-      const scripts = Array.from(document.scripts || []);
+      if (document.querySelector('meta[http-equiv="refresh"]')) return {detected: true, reason: "meta-refresh"};
+      const nav = performance.getEntriesByType("navigation")[0];
+      if (nav && (nav.type === "reload" || nav.type === "back_forward")) return {detected: true, reason: `nav:${nav.type}`};
+      // inline script heuristic
+      const scripts = document.scripts || [];
       for (const s of scripts) {
         if (!s.src) {
-          const t = (s.textContent || '').toLowerCase();
-          if (t.includes('location.reload') || t.includes('location.replace') || t.includes('location.href') || t.includes('history.forward') || t.includes('history.back')) {
-            return true;
+          const t = (s.textContent || "").toLowerCase();
+          if (t.includes("location.reload") || t.includes("location.replace") || t.includes("location.href") || t.includes("history.forward") || t.includes("history.back")) {
+            return {detected: true, reason: "inline-navigation-script"};
           }
         }
       }
     } catch (e) {}
-    return false;
+    return {detected: false, reason: null};
   }
 
-  function detectFrequentUnloads() {
-    // heuristic: if page has been navigated many times in the last short period, avoid auto-start
-    // we can check performance navigation timing entries count
-    try {
-      const entries = performance.getEntriesByType('navigation');
-      if (entries && entries.length > 1) return true;
-    } catch (e) {}
-    return false;
+  let conflict = detectConflictOnce();
+  setInterval(() => { conflict = detectConflictOnce(); updateLED(); }, 1200);
+
+  // ---------- UI BUILD ----------
+  const panel = document.createElement("div");
+  panel.id = "neonUltraPanel_v53";
+  panel.innerHTML = `
+    <div class="panel-wrap">
+      <div class="header">
+        <div id="led" class="led" title=""></div>
+        <div class="title">⚡ Neon Panel Ultra</div>
+        <div class="hdr-actions">
+          <button id="forceBtn" title="Force start (override conflict)">Force</button>
+          <button id="minimizeBtn" title="Minimize/restore">_</button>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button id="btnAuto">Start Auto</button>
+        <button id="btnRandom">🎲 Random</button>
+        <button id="btnNow">⟳ Now</button>
+        <button id="btnBack">⬅</button>
+        <button id="btnFwd">➡</button>
+
+        <label class="lbl">Interval <input id="inInterval" type="number" min="200" step="100"></label>
+        <label class="lbl">Rand min <input id="inRandMin" type="number" min="200" step="100"></label>
+        <label class="lbl">Rand max <input id="inRandMax" type="number" min="200" step="100"></label>
+
+        <label class="lbl wide">Keyword <input id="inKeyword" type="text" placeholder="stop when appears"></label>
+        <label class="lbl">Theme <input id="inColor" type="color"></label>
+        <label class="lbl chk"><input id="inCache" type="checkbox">Cache-bust</label>
+        <label class="lbl chk"><input id="inSound" type="checkbox">Sound</label>
+      </div>
+
+      <div class="status-row">
+        <div class="progress"><div id="progBar"></div></div>
+        <div class="status-text"><span id="stText">idle</span> • <span id="stCount">0</span></div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  // mini button (tiny glowing circle)
+  const miniBtn = document.createElement("div");
+  miniBtn.id = "neonUltraMini_v53";
+  miniBtn.title = "⚡ Neon Panel Ultra (click to open)";
+  document.body.appendChild(miniBtn);
+
+  // ---------- STYLES ----------
+  const css = `
+  #neonUltraPanel_v53, #neonUltraMini_v53 { z-index:2147483647; font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; }
+  #neonUltraPanel_v53 { position: fixed; right: 20px; bottom: 20px; min-width: 320px; background: rgba(0,0,0,0.6); border-radius:12px; padding:10px; border:2px solid ${state.theme}; box-shadow:0 0 18px ${state.theme}, 0 0 36px ${state.theme}; color:${state.theme}; backdrop-filter: blur(4px); cursor: grab; user-select:none; }
+  #neonUltraPanel_v53.moving { transition: none !important; }
+  #neonUltraPanel_v53 .header { display:flex; align-items:center; gap:8px; }
+  #neonUltraPanel_v53 .led { width:12px; height:12px; border-radius:50%; background:${conflict.detected ? '#ff3b3b' : state.theme}; box-shadow: 0 0 10px ${conflict.detected ? '#ff3b3b' : state.theme}; border:1px solid rgba(255,255,255,0.06); }
+  #neonUltraPanel_v53 .title { font-weight:800; flex:1; color:var(--theme); text-shadow:0 0 8px var(--theme); }
+  #neonUltraPanel_v53 .hdr-actions button { margin-left:6px; padding:4px 8px; border-radius:6px; border:none; background:var(--theme); color:#000; font-weight:800; cursor:pointer; box-shadow:0 0 8px var(--theme); }
+  #neonUltraPanel_v53 .controls { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; align-items:center; }
+  #neonUltraPanel_v53 .controls button { padding:6px 10px; border-radius:8px; border:none; cursor:pointer; background:var(--theme); color:#000; font-weight:800; box-shadow:0 0 8px var(--theme); }
+  #neonUltraPanel_v53 .controls .lbl { display:flex; align-items:center; gap:6px; color:var(--theme); font-weight:800; }
+  #neonUltraPanel_v53 .controls input[type="number"], #neonUltraPanel_v53 input[type="text"] { background:#000; color:var(--theme); border:2px solid var(--theme); padding:4px 6px; border-radius:6px; font-weight:700; width:90px; }
+  #neonUltraPanel_v53 .controls input[type="color"] { width:36px; height:30px; border-radius:6px; padding:0; border:none; cursor:pointer; box-shadow:0 0 8px var(--theme); }
+  #neonUltraPanel_v53 .controls .wide input[type="text"] { width:180px; }
+  #neonUltraPanel_v53 .controls .chk input { width:14px; height:14px; }
+  #neonUltraPanel_v53 .status-row { display:flex; gap:8px; align-items:center; margin-top:8px; }
+  #neonUltraPanel_v53 .progress { flex:1; height:8px; background: rgba(255,255,255,0.06); border-radius:999px; overflow:hidden; border:1px solid var(--theme); }
+  #neonUltraPanel_v53 #progBar { width:0%; height:100%; background:var(--theme); transition: width .1s linear; box-shadow:0 0 8px var(--theme); }
+  #neonUltraPanel_v53 .status-text { font-weight:800; color:var(--theme); min-width:120px; text-align:right; }
+  #neonUltraMini_v53 { position: fixed; width:34px; height:34px; border-radius:50%; background: ${state.theme}; box-shadow:0 0 20px ${state.theme}, 0 0 40px ${state.theme}; right:20px; bottom:20px; cursor:pointer; display:none; z-index:2147483648; }
+  #neonUltraMini_v53:hover { transform: scale(1.12); box-shadow:0 0 28px ${state.theme}, 0 0 52px ${state.theme}; }
+  @media (max-width:520px){ #neonUltraPanel_v53 { min-width:90vw; } }
+  `;
+  const style = document.createElement("style");
+  style.textContent = css;
+  document.head.appendChild(style);
+
+  // set CSS theme variable
+  function applyThemeColor(color) {
+    panel.style.setProperty("--theme", color);
+    // update static inline elements too
+    const leds = panel.querySelectorAll(".led");
+    leds.forEach(l => l.style.background = conflict.detected ? "#ff3b3b" : color);
+    panel.style.borderColor = color;
+    panel.style.boxShadow = `0 0 18px ${color}, 0 0 36px ${color}`;
+    const btns = panel.querySelectorAll(".controls button, .hdr-actions button");
+    btns.forEach(b => { b.style.background = color; b.style.boxShadow = `0 0 8px ${color}`; });
+    miniBtn.style.background = color;
+    miniBtn.style.boxShadow = `0 0 20px ${color}, 0 0 40px ${color}`;
   }
+  applyThemeColor(state.theme);
 
-  // composite detection
-  function detectExternalNavigator() {
-    if (detectMetaRefresh()) return {detected:true, reason:'meta-refresh tag'};
-    if (detectNavTypeReloadOrBackForward()) return {detected:true, reason:'recent navigation type (reload/back_forward)'};
-    if (detectInlineScriptsCallingLocation()) return {detected:true, reason:'inline script contains location/history calls'};
-    if (detectFrequentUnloads()) return {detected:true, reason:'multiple navigation entries'};
-    return {detected:false, reason:null};
-  }
+  // ---------- ELEMENT REFS ----------
+  const ledEl = panel.querySelector("#led");
+  const btnAuto = panel.querySelector("#btnAuto");
+  const btnRandom = panel.querySelector("#btnRandom");
+  const btnNow = panel.querySelector("#btnNow");
+  const btnBack = panel.querySelector("#btnBack");
+  const btnFwd = panel.querySelector("#btnFwd");
+  const inInterval = panel.querySelector("#inInterval");
+  const inRandMin = panel.querySelector("#inRandMin");
+  const inRandMax = panel.querySelector("#inRandMax");
+  const inKeyword = panel.querySelector("#inKeyword");
+  const inColor = panel.querySelector("#inColor");
+  const inCache = panel.querySelector("#inCache");
+  const inSound = panel.querySelector("#inSound");
+  const btnMin = panel.querySelector("#minimizeBtn");
+  const btnForce = panel.querySelector("#forceBtn");
+  const progBar = panel.querySelector("#progBar");
+  const stText = panel.querySelector("#stText");
+  const stCount = panel.querySelector("#stCount");
 
-  // ----- conflict indicator & logic -----
-  let conflict = false;
-  let conflictReason = null;
-  function updateConflictState() {
-    const res = detectExternalNavigator();
-    conflict = !!res.detected;
-    conflictReason = res.reason;
-    led.style.background = conflict ? '#ff3b3b' : 'var(--nu, #39ff14)';
-    led.title = conflict ? `External navigation detected: ${conflictReason}. Auto-start disabled.` : 'No external navigation detected — auto-start allowed';
-    // if conflict detected, we prevent auto-start; if user had enabled previously, we leave enabled=false and allow manual force
-    if (conflict && state.enabled) {
-      // if previously enabled, we stop it but remember user-intent? We'll stop to be safe.
-      stopAuto(false);
-    }
-  }
+  // initialize inputs
+  inInterval.value = state.intervalMs;
+  inRandMin.value = state.randomMin;
+  inRandMax.value = state.randomMax;
+  inKeyword.value = state.keyword;
+  inColor.value = state.theme;
+  inCache.checked = !!state.cacheBust;
+  inSound.checked = !!state.sound;
+  btnAuto.textContent = state.autoRefresh ? "Stop Auto" : "Start Auto";
+  btnRandom.textContent = state.useRandom ? "Stop Random" : "🎲 Random";
 
-  // update conflict right away (and after short delay to catch late inline scripts)
-  updateConflictState();
-  setTimeout(updateConflictState, 500);
+  // ---------- REFRESH LOGIC ----------
+  let runner = null;
+  let refreshCounter = 0;
+  let nextDue = null;
+  let progressTick = null;
 
-  // watch for meta refresh additions or script insertions (mutation observer)
-  const mo = new MutationObserver((mutations) => {
-    let recheck = false;
-    for (const m of mutations) {
-      if (m.type === 'childList') {
-        for (const n of m.addedNodes) {
-          if (n.nodeType === 1 && (n.tagName === 'META' || n.tagName === 'SCRIPT')) recheck = true;
-        }
-      }
-      if (m.type === 'attributes' && m.target.tagName === 'META') recheck = true;
-    }
-    if (recheck) updateConflictState();
-  });
-  try { mo.observe(document.documentElement || document, { childList: true, subtree: true, attributes: true }); } catch (e) {}
-
-  // ----- core refresh logic -----
-  let ticker = null, nextDue = null, refreshCount = 0, startTime = null;
   function beep() {
     if (!state.sound) return;
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const o = ctx.createOscillator(); const g = ctx.createGain();
-      o.type = 'sine'; o.frequency.value = 880; o.connect(g); g.connect(ctx.destination);
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "sine"; o.frequency.value = 880;
+      o.connect(g); g.connect(ctx.destination);
       const now = ctx.currentTime;
-      g.gain.setValueAtTime(0.0001, now); g.gain.exponentialRampToValueAtTime(0.18, now + 0.01);
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.exponentialRampToValueAtTime(0.18, now + 0.01);
       g.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
       o.start(now); o.stop(now + 0.14);
       setTimeout(()=>ctx.close(), 250);
-    } catch (e) {}
+    } catch(e){}
   }
 
   function cacheReload() {
     if (!state.cacheBust) { location.reload(); return; }
     try {
       const u = new URL(location.href);
-      u.searchParams.set('_nu', Date.now().toString());
+      u.searchParams.set("_nu", Date.now().toString());
       location.replace(u.toString());
-    } catch (e) { location.reload(); }
-  }
-
-  function getIntervalNow() {
-    if (!state.randomMode) return Math.max(200, parseInt(state.intervalMs,10) || 1000);
-    const min = Math.max(200, parseInt(state.intervalMs,10) || 1000);
-    const max = min * 2;
-    return Math.floor(Math.random() * (max - min + 1)) + min;
+    } catch {
+      location.reload();
+    }
   }
 
   function meetsKeyword() {
-    if (!state.untilKeyword || !state.untilKeyword.trim()) return false;
-    try { return document.body && document.body.innerText.toLowerCase().includes(state.untilKeyword.toLowerCase()); } catch (e) { return false; }
+    if (!state.keyword || !state.keyword.trim()) return false;
+    try { return document.body && document.body.innerText.toLowerCase().includes(state.keyword.toLowerCase()); } catch { return false; }
   }
 
-  function shouldContinue() {
-    if (state.maxCount > 0 && refreshCount >= state.maxCount) return false;
-    if (state.maxMinutes > 0 && startTime && ((Date.now() - startTime) / 60000) >= state.maxMinutes) return false;
-    if (state.untilKeyword && state.untilKeyword.trim() && meetsKeyword()) return false;
-    return true;
+  function shouldStopByLimits(startTime) {
+    // placeholder for maxCount / maxMinutes if you want to expand; currently not used but safe hook
+    return false;
   }
 
-  function updateProgress() {
-    if (!nextDue) { progressBar.style.width = '0%'; statusText.textContent = 'idle'; return; }
-    const remaining = Math.max(0, nextDue - Date.now());
-    const total = Math.max(1, nextDue - (nextDue - getIntervalNow())); // approximate
-    const pct = Math.max(0, Math.min(1, 1 - (remaining / total)));
-    progressBar.style.width = (pct * 100) + '%';
-    const secs = Math.ceil(remaining / 1000);
-    statusText.textContent = `next in ~${secs}s`;
+  function clearRunner() {
+    if (runner) { clearTimeout(runner); runner = null; }
+    if (progressTick) { clearInterval(progressTick); progressTick = null; }
+    nextDue = null;
+    progBar.style.width = "0%";
+    stText.textContent = "idle";
   }
 
-  function scheduleNextTick() {
-    clearInterval(ticker);
-    const dur = getIntervalNow();
-    nextDue = Date.now() + dur;
-    updateProgress();
-    ticker = setInterval(() => {
-      updateProgress();
-      if (Date.now() >= nextDue) {
-        clearInterval(ticker);
-        refreshCount++;
-        set('lastRefreshTs', Date.now());
-        countText.textContent = String(refreshCount);
-        if (!shouldContinue()) { stopAuto(true); return; }
-        beep();
-        cacheReload();
-      }
+  function scheduleNext(ms) {
+    clearRunner();
+    if (ms <= 0) { ms = 1000; }
+    nextDue = Date.now() + ms;
+    const start = Date.now();
+    progBar.style.width = "0%";
+    progressTick = setInterval(() => {
+      const rem = Math.max(0, nextDue - Date.now());
+      const pct = Math.max(0, Math.min(1, 1 - rem / ms));
+      progBar.style.width = (pct * 100) + "%";
+      stText.textContent = `next ~${Math.ceil(rem/1000)}s`;
     }, 120);
+
+    runner = setTimeout(() => {
+      clearRunner();
+      refreshCounter++;
+      stCount.textContent = String(refreshCounter);
+      if (meetsKeyword()) {
+        // found keyword -> stop everything
+        stopAll();
+        return;
+      }
+      beep();
+      cacheReload();
+    }, ms);
   }
 
   function startAuto() {
-    // prevent auto start if conflict detected
-    updateConflictState();
-    if (conflict) {
-      // leave state.enabled false, but allow user to force
-      state.enabled = false; set('enabled', false);
-      reflectUI();
+    stopRandom();
+    if (conflict.detected) {
+      // do not auto-start when conflict: leave user to manually force
+      stText.textContent = "blocked by external refresh";
       return;
     }
-    if (state.enabled) return;
-    state.enabled = true; set('enabled', true);
-    refreshCount = 0; countText.textContent = '0';
-    startTime = Date.now();
-    reflectUI();
-    scheduleNextTick();
+    state.autoRefresh = true; persist();
+    btnAuto.textContent = "Stop Auto";
+    scheduleNext(Math.max(200, parseInt(state.intervalMs,10) || 1000));
   }
 
-  function stopAuto(fromStopButton) {
-    state.enabled = false; set('enabled', false);
-    clearInterval(ticker); ticker = null; nextDue = null;
-    reflectUI();
-    updateProgress();
+  function stopAuto() {
+    state.autoRefresh = false; persist();
+    btnAuto.textContent = "Start Auto";
+    clearRunner();
   }
 
-  // reflect UI based on state
-  function reflectUI() {
-    toggleBtn.textContent = state.enabled ? 'Stop' : 'Start';
-    toggleBtn.classList.toggle('active', !!state.enabled);
-    intervalInput.value = state.intervalMs;
-    randomInput.checked = !!state.randomMode;
-    keywordInput.value = state.untilKeyword || '';
-    maxCountInput.value = state.maxCount || 0;
-    maxMinInput.value = state.maxMinutes || 0;
-    cacheInput.checked = !!state.cacheBust;
-    soundInput.checked = !!state.sound;
-  }
-  reflectUI();
-
-  // ----- wire UI -----
-// expand/minimize
-  dot.addEventListener('click', () => {
-    state.minimized = false; set('minimized', state.minimized);
-    full.hidden = false; dot.style.display = 'none'; panel.classList.add('open');
-  });
-  closeBtn.addEventListener('click', () => {
-    state.minimized = true; set('minimized', state.minimized);
-    full.hidden = true; dot.style.display = ''; panel.classList.remove('open');
-    savePlacement();
-  });
-
-  // toggle start/stop (manual)
-  toggleBtn.addEventListener('click', () => {
-    // if conflict and not forced, disallow starting automatically; but user clicked, so allow manual start (but show warning)
-    updateConflictState();
-    if (conflict) {
-      if (!confirm(`External navigation detected (${conflictReason}). Force start anyway?`)) return;
+  function startRandom() {
+    stopAuto();
+    if (conflict.detected) {
+      stText.textContent = "blocked by external refresh";
+      return;
     }
-    if (state.enabled) stopAuto(true); else startAuto();
+    state.useRandom = true; persist();
+    btnRandom.textContent = "Stop Random";
+    // compute random interval and schedule tick chain
+    const loop = () => {
+      const min = Math.max(200, parseInt(state.randomMin,10) || 1000);
+      const max = Math.max(min, parseInt(state.randomMax,10) || (min*2));
+      const ms = Math.floor(Math.random() * (max - min + 1)) + min;
+      scheduleNext(ms);
+      // after runner fires the page will reload; this loop will be started after reload if state.useRandom remains true
+    };
+    loop();
+  }
+
+  function stopRandom() {
+    state.useRandom = false; persist();
+    btnRandom.textContent = "🎲 Random";
+    clearRunner();
+  }
+
+  function stopAll() {
+    state.autoRefresh = false;
+    state.useRandom = false;
+    persist();
+    btnAuto.textContent = "Start Auto";
+    btnRandom.textContent = "🎲 Random";
+    clearRunner();
+  }
+
+  // manual
+  btnNow.addEventListener("click", () => { beep(); cacheReload(); });
+
+  btnBack.addEventListener("click", () => { if (history.length > 1) history.back(); else alert("No previous page"); });
+  btnFwd.addEventListener("click", () => { history.forward(); });
+
+  // control buttons
+  btnAuto.addEventListener("click", () => {
+    if (state.autoRefresh) stopAuto();
+    else startAuto();
   });
 
-  // force start button - sets conflict override for this session (does not disable detection but allows start)
-  forceBtn.addEventListener('click', () => {
-    // Danger: user override — allow start regardless
-    if (state.enabled) { stopAuto(true); return; }
-    // start even if conflict
-    state.enabled = true; set('enabled', true);
-    refreshCount = 0; startTime = Date.now();
-    reflectUI();
-    scheduleNextTick();
+  btnRandom.addEventListener("click", () => {
+    if (state.useRandom) stopRandom();
+    else startRandom();
   });
 
-  nowBtn.addEventListener('click', () => { beep(); cacheReload(); });
-  backBtn.addEventListener('click', () => { if (history.length > 1) history.back(); else alert('No previous page'); });
-  fwdBtn.addEventListener('click', () => { history.forward(); });
-
-  intervalInput.addEventListener('change', () => {
-    const v = parseInt(intervalInput.value, 10);
-    if (isNaN(v) || v < 200) { intervalInput.value = state.intervalMs; return; }
-    state.intervalMs = v; set('intervalMs', v);
-    if (state.enabled) scheduleNextTick();
-  });
-  randomInput.addEventListener('change', () => { state.randomMode = !!randomInput.checked; set('randomMode', state.randomMode); if (state.enabled) scheduleNextTick(); });
-  keywordInput.addEventListener('change', () => { state.untilKeyword = keywordInput.value || ''; set('untilKeyword', state.untilKeyword); });
-  maxCountInput.addEventListener('change', () => { state.maxCount = Math.max(0, parseInt(maxCountInput.value || '0', 10)); set('maxCount', state.maxCount); });
-  maxMinInput.addEventListener('change', () => { state.maxMinutes = Math.max(0, parseInt(maxMinInput.value || '0', 10)); set('maxMinutes', state.maxMinutes); });
-  cacheInput.addEventListener('change', () => { state.cacheBust = !!cacheInput.checked; set('cacheBust', state.cacheBust); });
-  themeSelect.addEventListener('change', () => { state.theme = themeSelect.value; set('theme', state.theme); applyTheme(state.theme); });
-  soundInput.addEventListener('change', () => { state.sound = !!soundInput.checked; set('sound', state.sound); });
-
-  // hotkeys
-  document.addEventListener('keydown', (e) => {
-    if (!e.ctrlKey || !e.altKey) return;
-    const k = e.key.toLowerCase();
-    if (k === 'r') { e.preventDefault(); toggleBtn.click(); }
-    else if (k === 'n') { e.preventDefault(); nowBtn.click(); }
-    else if (k === 'm') { e.preventDefault(); if (state.minimized) { dot.click(); } else { closeBtn.click(); } }
+  btnForce.addEventListener("click", () => {
+    // force start override: start whichever was last chosen, or start auto
+    if (state.useRandom) startRandom();
+    else startAuto();
   });
 
-  // draggable
-  let dragging = false, dx = 0, dy = 0;
-  panel.addEventListener('mousedown', (ev) => {
-    const tag = (ev.target.tagName || '').toUpperCase();
-    if (['INPUT','BUTTON','SELECT','LABEL'].includes(tag)) return;
+  // inputs
+  inInterval.addEventListener("change", (e) => {
+    const v = Math.max(200, parseInt(e.target.value,10) || 200);
+    state.intervalMs = v; persist();
+    if (state.autoRefresh) startAuto();
+  });
+  inRandMin.addEventListener("change", (e) => { state.randomMin = Math.max(200, parseInt(e.target.value,10) || 200); persist(); });
+  inRandMax.addEventListener("change", (e) => { state.randomMax = Math.max(200, parseInt(e.target.value,10) || 200); persist(); });
+  inKeyword.addEventListener("change", (e) => { state.keyword = e.target.value || ""; persist(); });
+  inColor.addEventListener("input", (e) => {
+    state.theme = e.target.value; persist();
+    applyThemeColor(state.theme);
+  });
+  inCache.addEventListener("change", (e) => { state.cacheBust = !!e.target.checked; persist(); });
+  inSound.addEventListener("change", (e) => { state.sound = !!e.target.checked; persist(); });
+
+  // ---------- MINIMIZE / MINI BUTTON ----------
+  function showMini() {
+    panel.style.display = "none";
+    miniBtn.style.display = "block";
+  }
+  function hideMini() {
+    panel.style.display = "block";
+    miniBtn.style.display = "none";
+  }
+
+  // toggle by btnMin or miniBtn click
+  btnMin.addEventListener("click", () => {
+    state.minimized = true; persist();
+    showMini();
+  });
+  miniBtn.addEventListener("click", () => {
+    state.minimized = false; persist();
+    hideMini();
+  });
+
+  // restore initial visibility & position
+  (function restorePlacement() {
+    // position
+    if (state.x !== null && state.y !== null) {
+      panel.style.left = state.x + "px"; panel.style.top = state.y + "px";
+      panel.style.right = "auto"; panel.style.bottom = "auto"; panel.style.position = "fixed";
+      miniBtn.style.left = state.x + "px"; miniBtn.style.top = state.y + "px";
+      miniBtn.style.right = "auto"; miniBtn.style.bottom = "auto"; miniBtn.style.position = "fixed";
+    } else {
+      // default anchored bottom-right
+      panel.style.right = "20px"; panel.style.bottom = "20px";
+      miniBtn.style.right = "20px"; miniBtn.style.bottom = "20px";
+    }
+
+    if (state.minimized) showMini(); else hideMini();
+  })();
+
+  // ---------- DRAGGING (full panel) with movement threshold ----------
+  let dragging = false, dragStartX = 0, dragStartY = 0, moved = false;
+  const DRAG_THRESHOLD = 6;
+
+  panel.addEventListener("mousedown", (ev) => {
+    const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toUpperCase() : "";
+    // don't start drag when interacting with controls
+    if (["INPUT","BUTTON","SELECT","LABEL","TEXTAREA"].includes(tag)) return;
     dragging = true;
-    const rect = panel.getBoundingClientRect();
-    dx = ev.clientX - rect.left; dy = ev.clientY - rect.top;
-    panel.classList.add('moving');
+    moved = false;
+    dragStartX = ev.clientX - (panel.getBoundingClientRect().left || 0);
+    dragStartY = ev.clientY - (panel.getBoundingClientRect().top || 0);
+    panel.classList.add("moving");
     ev.preventDefault();
   });
-  document.addEventListener('mousemove', (ev) => {
+
+  document.addEventListener("mousemove", (ev) => {
     if (!dragging) return;
-    let left = ev.clientX - dx;
-    let top = ev.clientY - dy;
-    // clamp
-    left = Math.max(4, Math.min(window.innerWidth - panel.offsetWidth - 4, left));
-    top = Math.max(4, Math.min(window.innerHeight - panel.offsetHeight - 4, top));
-    panel.style.left = left + 'px'; panel.style.top = top + 'px';
-    panel.style.right = 'auto'; panel.style.bottom = 'auto'; panel.style.position = 'fixed';
+    const left = Math.max(4, Math.min(window.innerWidth - panel.offsetWidth - 4, ev.clientX - dragStartX));
+    const top  = Math.max(4, Math.min(window.innerHeight - panel.offsetHeight - 4, ev.clientY - dragStartY));
+    if (!moved && (Math.abs(ev.clientX - (dragStartX + panel.getBoundingClientRect().left)) > DRAG_THRESHOLD || Math.abs(ev.clientY - (dragStartY + panel.getBoundingClientRect().top)) > DRAG_THRESHOLD)) {
+      moved = true;
+    }
+    panel.style.left = left + "px"; panel.style.top = top + "px"; panel.style.right = "auto"; panel.style.bottom = "auto"; panel.style.position = "fixed";
+    // keep miniBtn in sync (so when switching to mini the position matches)
+    miniBtn.style.left = panel.style.left; miniBtn.style.top = panel.style.top; miniBtn.style.right = "auto"; miniBtn.style.bottom = "auto";
   });
-  document.addEventListener('mouseup', () => {
+
+  document.addEventListener("mouseup", () => {
     if (!dragging) return;
-    dragging = false; panel.classList.remove('moving');
-    savePlacement();
+    dragging = false;
+    panel.classList.remove("moving");
+    if (moved) {
+      // save new position
+      state.x = panel.getBoundingClientRect().left;
+      state.y = panel.getBoundingClientRect().top;
+      persist();
+    }
   });
 
-  // periodically update conflict detection and UI (in case other script appears after load)
-  setInterval(updateConflictState, 1200);
-
-  // persist minimized state when user expands/minimizes via dot/closeBtn - already saved; also when window unload save placement
-  window.addEventListener('beforeunload', () => {
-    set('minimized', state.minimized);
-    savePlacement();
+  // ---------- DRAGGING (mini button) ----------
+  let miniDragging = false, miniOffX=0, miniOffY=0, miniMoved=false;
+  miniBtn.addEventListener("mousedown", (ev) => {
+    miniDragging = true;
+    miniMoved = false;
+    miniOffX = ev.clientX - miniBtn.getBoundingClientRect().left;
+    miniOffY = ev.clientY - miniBtn.getBoundingClientRect().top;
+    ev.preventDefault();
   });
 
-  // start minimized by default (restored)
-  if (state.minimized) {
-    full.hidden = true; dot.style.display = '';
-  } else {
-    full.hidden = false; dot.style.display = 'none';
-  }
+  document.addEventListener("mousemove", (ev) => {
+    if (!miniDragging) return;
+    const left = Math.max(4, Math.min(window.innerWidth - miniBtn.offsetWidth - 4, ev.clientX - miniOffX));
+    const top  = Math.max(4, Math.min(window.innerHeight - miniBtn.offsetHeight - 4, ev.clientY - miniOffY));
+    if (!miniMoved && (Math.abs(ev.clientX - (miniOffX + miniBtn.getBoundingClientRect().left)) > DRAG_THRESHOLD || Math.abs(ev.clientY - (miniOffY + miniBtn.getBoundingClientRect().top)) > DRAG_THRESHOLD)) {
+      miniMoved = true;
+    }
+    miniBtn.style.left = left + "px"; miniBtn.style.top = top + "px"; miniBtn.style.right = "auto"; miniBtn.style.bottom = "auto"; miniBtn.style.position = "fixed";
+    // keep full panel in sync
+    panel.style.left = miniBtn.style.left; panel.style.top = miniBtn.style.top;
+  });
 
-  // restore enabled state only if no conflict; otherwise, disabled by default
-  if (state.enabled) {
-    updateConflictState();
-    if (!conflict) startAuto(); // only auto-start if no conflict
-    else {
-      // keep disabled but show indicator
-      state.enabled = false; set('enabled', false);
-      reflectUI();
+  document.addEventListener("mouseup", () => {
+    if (!miniDragging) return;
+    miniDragging = false;
+    if (miniMoved) {
+      state.x = miniBtn.getBoundingClientRect().left;
+      state.y = miniBtn.getBoundingClientRect().top;
+      persist();
+    }
+  });
+
+  // ---------- LED update ----------
+  function updateLED() {
+    if (conflict.detected) {
+      ledEl.style.background = "#ff3b3b";
+      ledEl.style.boxShadow = "0 0 10px #ff3b3b";
+      ledEl.title = `External navigation detected: ${conflict.reason || "unknown"}. Auto-start disabled.`;
+    } else {
+      ledEl.style.background = state.theme;
+      ledEl.style.boxShadow = `0 0 10px ${state.theme}`;
+      ledEl.title = "No external navigation detected — auto-start allowed.";
     }
   }
+  updateLED();
 
-  // initial reflect
+  // ---------- HOTKEYS ----------
+  document.addEventListener("keydown", (e) => {
+    if (!e.ctrlKey || !e.altKey) return;
+    const k = (e.key || "").toLowerCase();
+    if (k === "r") { e.preventDefault(); if (state.autoRefresh) stopAuto(); else startAuto(); }
+    if (k === "n") { e.preventDefault(); btnNow.click(); }
+    if (k === "m") { e.preventDefault(); if (state.minimized) { miniBtn.click(); } else { btnMin.click(); } }
+    if (k === "x") { e.preventDefault(); stopAll(); }
+  });
+
+  // ---------- STARTUP BEHAVIOR ----------
+  // ensure UI shows current state
+  function reflectUI() {
+    inInterval.value = state.intervalMs;
+    inRandMin.value = state.randomMin;
+    inRandMax.value = state.randomMax;
+    inKeyword.value = state.keyword;
+    inColor.value = state.theme;
+    inCache.checked = !!state.cacheBust;
+    inSound.checked = !!state.sound;
+    btnAuto.textContent = state.autoRefresh ? "Stop Auto" : "Start Auto";
+    btnRandom.textContent = state.useRandom ? "Stop Random" : "🎲 Random";
+    applyThemeColor(state.theme);
+  }
   reflectUI();
 
-  // expose a debug property for console if user wants to inspect state
-  try { window.__neonUltra = { state, detectExternalNavigator, updateConflictState }; } catch (e) {}
+  // Do not auto-start if conflict detected; otherwise resume last mode
+  if (!conflict.detected) {
+    if (state.useRandom) startRandom();
+    else if (state.autoRefresh) startAuto();
+  } else {
+    // if there was a saved enabled state but conflict exists, keep system stopped
+    stText.textContent = "blocked by external refresh";
+  }
+
+  // expose debug helper
+  try { window.__neonUltra_v53 = { state, persist, detectConflictOnce }; } catch(e) {}
+
+  // save periodically as well (in case of abrupt unload)
+  setInterval(persist, 3000);
 
 })();
