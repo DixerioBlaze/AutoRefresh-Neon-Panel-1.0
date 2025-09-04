@@ -2,7 +2,8 @@
 
 > A conflict-safe, persistent Tampermonkey panel for auto-refreshing, navigation, and monitoring.
 
-\\![screenshot](assets/screenshot.png)
+\\![screenshot](assets/<img width="1912" height="626" alt="image" src="https://github.com/user-attachments/assets/89e6a04d-02d9-455e-98e1-3ad66fa57468" />
+)
 
 ## Features
 - Start/Stop auto-refresh, manual refresh, back/forward
