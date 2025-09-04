@@ -1,0 +1,536 @@
+// ==UserScript==
+// @name         Neon Panel Ultra — Conflict-Safe, Persistent, Start-Minimized
+// @namespace    http://tampermonkey.net/
+// @version      1.1
+// @description  Ultra neon auto-refresh panel: starts minimized, saves position/shape per-domain, detects other refresh/forward scripts (meta/inline/nav) and prevents auto-start. Force-start override included. All settings persist per-domain.
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // Safety: don't run in cross-origin iframes
+  try { if (window.top !== window.self) return; } catch (e) { return; }
+
+  // ----- helpers for per-domain storage -----
+  const DOMAIN = location.hostname;
+  const SKEY = (k) => `neonUltra_v1_${k}_${DOMAIN}`;
+  const get = (k, d = null) => {
+    const v = localStorage.getItem(SKEY(k));
+    if (v === null) return d;
+    try { return JSON.parse(v); } catch { return v; }
+  };
+  const set = (k, v) => localStorage.setItem(SKEY(k), JSON.stringify(v));
+
+  // ----- defaults -----
+  const defaults = {
+    minimized: true,           // start minimized
+    left: null, top: null,     // position
+    width: null, height: null, // size shape (optional)
+    enabled: false,
+    intervalMs: 1000,
+    randomMode: false,
+    maxCount: 0,
+    maxMinutes: 0,
+    untilKeyword: "",
+    cacheBust: true,
+    theme: "Neon Green",
+    sound: true
+  };
+
+  // load settings (per domain)
+  let state = {
+    minimized: get('minimized', defaults.minimized),
+    left: get('left', defaults.left),
+    top: get('top', defaults.top),
+    width: get('width', defaults.width),
+    height: get('height', defaults.height),
+    enabled: get('enabled', defaults.enabled),
+    intervalMs: get('intervalMs', defaults.intervalMs),
+    randomMode: get('randomMode', defaults.randomMode),
+    maxCount: get('maxCount', defaults.maxCount),
+    maxMinutes: get('maxMinutes', defaults.maxMinutes),
+    untilKeyword: get('untilKeyword', defaults.untilKeyword),
+    cacheBust: get('cacheBust', defaults.cacheBust),
+    theme: get('theme', defaults.theme),
+    sound: get('sound', defaults.sound)
+  };
+
+  // ----- theme palette -----
+  const THEMES = {
+    "Neon Green": "#39ff14",
+    "Neon Blue": "#3bf5ff",
+    "Neon Pink": "#ff3bf8",
+    "Neon Purple": "#a93bff",
+    "Neon Amber": "#ffc247"
+  };
+
+  // ----- Create panel (minimizable) -----
+  const panel = document.createElement('div');
+  panel.id = 'neonUltraPanel';
+  panel.innerHTML = `
+    <div class="mini-dot" title="Click to expand panel"></div>
+    <div class="full" role="dialog" aria-label="Neon control panel" hidden>
+      <div class="top">
+        <div class="title">Neon Panel Ultra</div>
+        <div class="led" title="Conflict indicator"></div>
+        <button id="forceBtn" title="Force start/override detection">Force Start</button>
+        <button id="closeBtn" title="Minimize panel">_</button>
+      </div>
+      <div class="controls">
+        <button id="toggleBtn">Start</button>
+        <button id="nowBtn" title="Refresh now">⟳ Now</button>
+        <button id="backBtn" title="Back">⬅</button>
+        <button id="fwdBtn" title="Forward">➡</button>
+
+        <label class="field"><span>Interval</span><input id="interval" type="number" min="200" step="100"/></label>
+        <label class="field chk"><input id="random" type="checkbox"/><span>Random ×2</span></label>
+        <label class="field"><span>Until keyword</span><input id="keyword" type="text" placeholder="keyword (optional)"/></label>
+
+        <label class="field"><span>Max #</span><input id="maxCount" type="number" min="0" step="1"/></label>
+        <label class="field"><span>Max min</span><input id="maxMin" type="number" min="0" step="1"/></label>
+
+        <label class="field chk"><input id="cache" type="checkbox"/><span>Cache-bust</span></label>
+        <label class="field"><span>Theme</span><select id="theme"></select></label>
+        <label class="field chk"><input id="sound" type="checkbox"/><span>Sound</span></label>
+      </div>
+
+      <div class="progress-row">
+        <div id="progressWrap"><div id="progressBar"></div></div>
+        <div class="status"><span id="statusText">idle</span> • <span id="countText">0</span></div>
+      </div>
+      <div class="hint">Hotkeys: Ctrl+Alt+R toggle • Ctrl+Alt+N refresh now • Ctrl+Alt+M minimize</div>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  // ----- styles -----
+  const style = document.createElement('style');
+  style.textContent = `
+    #neonUltraPanel { position: fixed; z-index: 2147483647; right: 20px; bottom: 20px; font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; }
+    #neonUltraPanel .mini-dot { width: 18px; height: 18px; border-radius: 50%; background: var(--nu, #39ff14); box-shadow: 0 0 12px var(--nu), 0 0 24px var(--nu); cursor: pointer; }
+    #neonUltraPanel .full { width: 760px; max-width: 94vw; background: rgba(0,0,0,0.6); border-radius: 12px; padding: 10px; border: 2px solid var(--nu, #39ff14); box-shadow: 0 0 18px var(--nu), 0 0 36px var(--nu); color: var(--nu, #39ff14); margin-top: 8px; }
+    #neonUltraPanel .top { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+    #neonUltraPanel .title { font-weight:800; font-size:13px; color:var(--nu); flex:1; }
+    #neonUltraPanel .led { width:12px; height:12px; border-radius:50%; background:#444; box-shadow:0 0 8px rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.06); margin-right:6px; }
+    #neonUltraPanel button { padding:6px 10px; border-radius:8px; border:none; background:var(--nu); color:#000; font-weight:700; cursor:pointer; box-shadow:0 0 10px var(--nu); }
+    #neonUltraPanel .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:8px; }
+    #neonUltraPanel .field { display:flex; align-items:center; gap:6px; color:var(--nu); font-weight:700; font-size:12px; }
+    #neonUltraPanel .field input[type="number"], #neonUltraPanel .field input[type="text"], #neonUltraPanel .field select { background:#000; color:var(--nu); border:2px solid var(--nu); padding:4px 6px; border-radius:6px; font-weight:800; box-shadow: inset 0 0 10px rgba(0,0,0,0.6); min-width:80px; }
+    #neonUltraPanel .field.chk input { width:14px; height:14px; }
+    #progressWrap { height:10px; background:rgba(255,255,255,0.08); border-radius:999px; overflow:hidden; border:1px solid var(--nu); flex:1 1 200px; min-width:120px; }
+    #progressBar { width:0%; height:100%; background:var(--nu); transition:width .1s linear; box-shadow:0 0 12px var(--nu); }
+    .progress-row { display:flex; gap:8px; align-items:center; }
+    .status { color:var(--nu); font-weight:800; font-size:12px; min-width:120px; text-align:right; }
+    .hint { opacity:0.6; font-size:11px; margin-top:6px; color:var(--nu); }
+    #neonUltraPanel.moving { transition:none !important; }
+    #neonUltraPanel .full[hidden] { display:none; }
+    /* compact small screens */
+    @media (max-width:560px){ #neonUltraPanel .full { width:95vw; } }
+  `;
+  document.head.appendChild(style);
+
+  // ----- element refs -----
+  const dot = panel.querySelector('.mini-dot');
+  const full = panel.querySelector('.full');
+  const led = panel.querySelector('.led');
+  const forceBtn = panel.querySelector('#forceBtn');
+  const closeBtn = panel.querySelector('#closeBtn');
+  const toggleBtn = panel.querySelector('#toggleBtn');
+  const nowBtn = panel.querySelector('#nowBtn');
+  const backBtn = panel.querySelector('#backBtn');
+  const fwdBtn = panel.querySelector('#fwdBtn');
+  const intervalInput = panel.querySelector('#interval');
+  const randomInput = panel.querySelector('#random');
+  const keywordInput = panel.querySelector('#keyword');
+  const maxCountInput = panel.querySelector('#maxCount');
+  const maxMinInput = panel.querySelector('#maxMin');
+  const cacheInput = panel.querySelector('#cache');
+  const themeSelect = panel.querySelector('#theme');
+  const soundInput = panel.querySelector('#sound');
+  const progressBar = panel.querySelector('#progressBar');
+  const statusText = panel.querySelector('#statusText');
+  const countText = panel.querySelector('#countText');
+
+  // ----- fill theme select -----
+  Object.keys(THEMES).forEach(name => {
+    const o = document.createElement('option'); o.value = name; o.textContent = name;
+    if (name === state.theme) o.selected = true;
+    themeSelect.appendChild(o);
+  });
+
+  // ----- apply theme color -----
+  function applyTheme(name) {
+    const color = THEMES[name] || THEMES["Neon Green"];
+    panel.style.setProperty('--nu', color);
+  }
+  applyTheme(state.theme);
+
+  // ----- restore position and shape -----
+  function restorePlacement() {
+    if (state.left !== null && state.top !== null) {
+      panel.style.left = state.left + 'px';
+      panel.style.top = state.top + 'px';
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      panel.style.position = 'fixed';
+    } else {
+      // keep default bottom/right
+      panel.style.right = '20px';
+      panel.style.bottom = '20px';
+    }
+    if (state.width) full.style.width = state.width + 'px';
+    if (state.height) full.style.height = state.height + 'px';
+    if (state.minimized) {
+      full.hidden = true;
+      panel.classList.remove('open');
+      dot.style.display = ''; // show dot
+    } else {
+      full.hidden = false;
+      panel.classList.add('open');
+      dot.style.display = 'none';
+    }
+  }
+  restorePlacement();
+
+  // ----- save placement -----
+  function savePlacement() {
+    const rect = panel.getBoundingClientRect();
+    // Only save if panel is positioned fixed
+    if (panel.style.position === 'fixed') {
+      set('left', rect.left);
+      set('top', rect.top);
+      state.left = rect.left; state.top = rect.top;
+    }
+    // save width/height of full panel
+    set('width', full.offsetWidth);
+    set('height', full.offsetHeight);
+    state.width = full.offsetWidth; state.height = full.offsetHeight;
+  }
+
+  // ----- populate inputs with saved state -----
+  intervalInput.value = state.intervalMs;
+  randomInput.checked = !!state.randomMode;
+  keywordInput.value = state.untilKeyword || '';
+  maxCountInput.value = state.maxCount || 0;
+  maxMinInput.value = state.maxMinutes || 0;
+  cacheInput.checked = !!state.cacheBust;
+  soundInput.checked = !!state.sound;
+
+  // ----- conflict detection heuristics -----
+  function detectMetaRefresh() {
+    return !!document.querySelector('meta[http-equiv="refresh"]');
+  }
+
+  function detectNavTypeReloadOrBackForward() {
+    try {
+      const nav = performance.getEntriesByType('navigation')[0];
+      if (!nav) return false;
+      // types: navigate, reload, back_forward
+      return nav.type === 'reload' || nav.type === 'back_forward';
+    } catch (e) { return false; }
+  }
+
+  function detectInlineScriptsCallingLocation() {
+    // look for inline script tags containing keywords that suggest other scripts will reload/replace/forward
+    try {
+      const scripts = Array.from(document.scripts || []);
+      for (const s of scripts) {
+        if (!s.src) {
+          const t = (s.textContent || '').toLowerCase();
+          if (t.includes('location.reload') || t.includes('location.replace') || t.includes('location.href') || t.includes('history.forward') || t.includes('history.back')) {
+            return true;
+          }
+        }
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function detectFrequentUnloads() {
+    // heuristic: if page has been navigated many times in the last short period, avoid auto-start
+    // we can check performance navigation timing entries count
+    try {
+      const entries = performance.getEntriesByType('navigation');
+      if (entries && entries.length > 1) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  // composite detection
+  function detectExternalNavigator() {
+    if (detectMetaRefresh()) return {detected:true, reason:'meta-refresh tag'};
+    if (detectNavTypeReloadOrBackForward()) return {detected:true, reason:'recent navigation type (reload/back_forward)'};
+    if (detectInlineScriptsCallingLocation()) return {detected:true, reason:'inline script contains location/history calls'};
+    if (detectFrequentUnloads()) return {detected:true, reason:'multiple navigation entries'};
+    return {detected:false, reason:null};
+  }
+
+  // ----- conflict indicator & logic -----
+  let conflict = false;
+  let conflictReason = null;
+  function updateConflictState() {
+    const res = detectExternalNavigator();
+    conflict = !!res.detected;
+    conflictReason = res.reason;
+    led.style.background = conflict ? '#ff3b3b' : 'var(--nu, #39ff14)';
+    led.title = conflict ? `External navigation detected: ${conflictReason}. Auto-start disabled.` : 'No external navigation detected — auto-start allowed';
+    // if conflict detected, we prevent auto-start; if user had enabled previously, we leave enabled=false and allow manual force
+    if (conflict && state.enabled) {
+      // if previously enabled, we stop it but remember user-intent? We'll stop to be safe.
+      stopAuto(false);
+    }
+  }
+
+  // update conflict right away (and after short delay to catch late inline scripts)
+  updateConflictState();
+  setTimeout(updateConflictState, 500);
+
+  // watch for meta refresh additions or script insertions (mutation observer)
+  const mo = new MutationObserver((mutations) => {
+    let recheck = false;
+    for (const m of mutations) {
+      if (m.type === 'childList') {
+        for (const n of m.addedNodes) {
+          if (n.nodeType === 1 && (n.tagName === 'META' || n.tagName === 'SCRIPT')) recheck = true;
+        }
+      }
+      if (m.type === 'attributes' && m.target.tagName === 'META') recheck = true;
+    }
+    if (recheck) updateConflictState();
+  });
+  try { mo.observe(document.documentElement || document, { childList: true, subtree: true, attributes: true }); } catch (e) {}
+
+  // ----- core refresh logic -----
+  let ticker = null, nextDue = null, refreshCount = 0, startTime = null;
+  function beep() {
+    if (!state.sound) return;
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator(); const g = ctx.createGain();
+      o.type = 'sine'; o.frequency.value = 880; o.connect(g); g.connect(ctx.destination);
+      const now = ctx.currentTime;
+      g.gain.setValueAtTime(0.0001, now); g.gain.exponentialRampToValueAtTime(0.18, now + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+      o.start(now); o.stop(now + 0.14);
+      setTimeout(()=>ctx.close(), 250);
+    } catch (e) {}
+  }
+
+  function cacheReload() {
+    if (!state.cacheBust) { location.reload(); return; }
+    try {
+      const u = new URL(location.href);
+      u.searchParams.set('_nu', Date.now().toString());
+      location.replace(u.toString());
+    } catch (e) { location.reload(); }
+  }
+
+  function getIntervalNow() {
+    if (!state.randomMode) return Math.max(200, parseInt(state.intervalMs,10) || 1000);
+    const min = Math.max(200, parseInt(state.intervalMs,10) || 1000);
+    const max = min * 2;
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  function meetsKeyword() {
+    if (!state.untilKeyword || !state.untilKeyword.trim()) return false;
+    try { return document.body && document.body.innerText.toLowerCase().includes(state.untilKeyword.toLowerCase()); } catch (e) { return false; }
+  }
+
+  function shouldContinue() {
+    if (state.maxCount > 0 && refreshCount >= state.maxCount) return false;
+    if (state.maxMinutes > 0 && startTime && ((Date.now() - startTime) / 60000) >= state.maxMinutes) return false;
+    if (state.untilKeyword && state.untilKeyword.trim() && meetsKeyword()) return false;
+    return true;
+  }
+
+  function updateProgress() {
+    if (!nextDue) { progressBar.style.width = '0%'; statusText.textContent = 'idle'; return; }
+    const remaining = Math.max(0, nextDue - Date.now());
+    const total = Math.max(1, nextDue - (nextDue - getIntervalNow())); // approximate
+    const pct = Math.max(0, Math.min(1, 1 - (remaining / total)));
+    progressBar.style.width = (pct * 100) + '%';
+    const secs = Math.ceil(remaining / 1000);
+    statusText.textContent = `next in ~${secs}s`;
+  }
+
+  function scheduleNextTick() {
+    clearInterval(ticker);
+    const dur = getIntervalNow();
+    nextDue = Date.now() + dur;
+    updateProgress();
+    ticker = setInterval(() => {
+      updateProgress();
+      if (Date.now() >= nextDue) {
+        clearInterval(ticker);
+        refreshCount++;
+        set('lastRefreshTs', Date.now());
+        countText.textContent = String(refreshCount);
+        if (!shouldContinue()) { stopAuto(true); return; }
+        beep();
+        cacheReload();
+      }
+    }, 120);
+  }
+
+  function startAuto() {
+    // prevent auto start if conflict detected
+    updateConflictState();
+    if (conflict) {
+      // leave state.enabled false, but allow user to force
+      state.enabled = false; set('enabled', false);
+      reflectUI();
+      return;
+    }
+    if (state.enabled) return;
+    state.enabled = true; set('enabled', true);
+    refreshCount = 0; countText.textContent = '0';
+    startTime = Date.now();
+    reflectUI();
+    scheduleNextTick();
+  }
+
+  function stopAuto(fromStopButton) {
+    state.enabled = false; set('enabled', false);
+    clearInterval(ticker); ticker = null; nextDue = null;
+    reflectUI();
+    updateProgress();
+  }
+
+  // reflect UI based on state
+  function reflectUI() {
+    toggleBtn.textContent = state.enabled ? 'Stop' : 'Start';
+    toggleBtn.classList.toggle('active', !!state.enabled);
+    intervalInput.value = state.intervalMs;
+    randomInput.checked = !!state.randomMode;
+    keywordInput.value = state.untilKeyword || '';
+    maxCountInput.value = state.maxCount || 0;
+    maxMinInput.value = state.maxMinutes || 0;
+    cacheInput.checked = !!state.cacheBust;
+    soundInput.checked = !!state.sound;
+  }
+  reflectUI();
+
+  // ----- wire UI -----
+// expand/minimize
+  dot.addEventListener('click', () => {
+    state.minimized = false; set('minimized', state.minimized);
+    full.hidden = false; dot.style.display = 'none'; panel.classList.add('open');
+  });
+  closeBtn.addEventListener('click', () => {
+    state.minimized = true; set('minimized', state.minimized);
+    full.hidden = true; dot.style.display = ''; panel.classList.remove('open');
+    savePlacement();
+  });
+
+  // toggle start/stop (manual)
+  toggleBtn.addEventListener('click', () => {
+    // if conflict and not forced, disallow starting automatically; but user clicked, so allow manual start (but show warning)
+    updateConflictState();
+    if (conflict) {
+      if (!confirm(`External navigation detected (${conflictReason}). Force start anyway?`)) return;
+    }
+    if (state.enabled) stopAuto(true); else startAuto();
+  });
+
+  // force start button - sets conflict override for this session (does not disable detection but allows start)
+  forceBtn.addEventListener('click', () => {
+    // Danger: user override — allow start regardless
+    if (state.enabled) { stopAuto(true); return; }
+    // start even if conflict
+    state.enabled = true; set('enabled', true);
+    refreshCount = 0; startTime = Date.now();
+    reflectUI();
+    scheduleNextTick();
+  });
+
+  nowBtn.addEventListener('click', () => { beep(); cacheReload(); });
+  backBtn.addEventListener('click', () => { if (history.length > 1) history.back(); else alert('No previous page'); });
+  fwdBtn.addEventListener('click', () => { history.forward(); });
+
+  intervalInput.addEventListener('change', () => {
+    const v = parseInt(intervalInput.value, 10);
+    if (isNaN(v) || v < 200) { intervalInput.value = state.intervalMs; return; }
+    state.intervalMs = v; set('intervalMs', v);
+    if (state.enabled) scheduleNextTick();
+  });
+  randomInput.addEventListener('change', () => { state.randomMode = !!randomInput.checked; set('randomMode', state.randomMode); if (state.enabled) scheduleNextTick(); });
+  keywordInput.addEventListener('change', () => { state.untilKeyword = keywordInput.value || ''; set('untilKeyword', state.untilKeyword); });
+  maxCountInput.addEventListener('change', () => { state.maxCount = Math.max(0, parseInt(maxCountInput.value || '0', 10)); set('maxCount', state.maxCount); });
+  maxMinInput.addEventListener('change', () => { state.maxMinutes = Math.max(0, parseInt(maxMinInput.value || '0', 10)); set('maxMinutes', state.maxMinutes); });
+  cacheInput.addEventListener('change', () => { state.cacheBust = !!cacheInput.checked; set('cacheBust', state.cacheBust); });
+  themeSelect.addEventListener('change', () => { state.theme = themeSelect.value; set('theme', state.theme); applyTheme(state.theme); });
+  soundInput.addEventListener('change', () => { state.sound = !!soundInput.checked; set('sound', state.sound); });
+
+  // hotkeys
+  document.addEventListener('keydown', (e) => {
+    if (!e.ctrlKey || !e.altKey) return;
+    const k = e.key.toLowerCase();
+    if (k === 'r') { e.preventDefault(); toggleBtn.click(); }
+    else if (k === 'n') { e.preventDefault(); nowBtn.click(); }
+    else if (k === 'm') { e.preventDefault(); if (state.minimized) { dot.click(); } else { closeBtn.click(); } }
+  });
+
+  // draggable
+  let dragging = false, dx = 0, dy = 0;
+  panel.addEventListener('mousedown', (ev) => {
+    const tag = (ev.target.tagName || '').toUpperCase();
+    if (['INPUT','BUTTON','SELECT','LABEL'].includes(tag)) return;
+    dragging = true;
+    const rect = panel.getBoundingClientRect();
+    dx = ev.clientX - rect.left; dy = ev.clientY - rect.top;
+    panel.classList.add('moving');
+    ev.preventDefault();
+  });
+  document.addEventListener('mousemove', (ev) => {
+    if (!dragging) return;
+    let left = ev.clientX - dx;
+    let top = ev.clientY - dy;
+    // clamp
+    left = Math.max(4, Math.min(window.innerWidth - panel.offsetWidth - 4, left));
+    top = Math.max(4, Math.min(window.innerHeight - panel.offsetHeight - 4, top));
+    panel.style.left = left + 'px'; panel.style.top = top + 'px';
+    panel.style.right = 'auto'; panel.style.bottom = 'auto'; panel.style.position = 'fixed';
+  });
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false; panel.classList.remove('moving');
+    savePlacement();
+  });
+
+  // periodically update conflict detection and UI (in case other script appears after load)
+  setInterval(updateConflictState, 1200);
+
+  // persist minimized state when user expands/minimizes via dot/closeBtn - already saved; also when window unload save placement
+  window.addEventListener('beforeunload', () => {
+    set('minimized', state.minimized);
+    savePlacement();
+  });
+
+  // start minimized by default (restored)
+  if (state.minimized) {
+    full.hidden = true; dot.style.display = '';
+  } else {
+    full.hidden = false; dot.style.display = 'none';
+  }
+
+  // restore enabled state only if no conflict; otherwise, disabled by default
+  if (state.enabled) {
+    updateConflictState();
+    if (!conflict) startAuto(); // only auto-start if no conflict
+    else {
+      // keep disabled but show indicator
+      state.enabled = false; set('enabled', false);
+      reflectUI();
+    }
+  }
+
+  // initial reflect
+  reflectUI();
+
+  // expose a debug property for console if user wants to inspect state
+  try { window.__neonUltra = { state, detectExternalNavigator, updateConflictState }; } catch (e) {}
+
+})();
